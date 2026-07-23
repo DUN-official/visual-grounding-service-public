@@ -4,6 +4,12 @@ This project developed as a natural offshoot of building robot-vision capabiliti
 
 The interactive application compares local and GPT-guided visual grounding while keeping still-image attention as the primary research focus.
 
+## Live application
+
+Try the deployed Streamlit application:
+
+[Open the Visual Grounding Service](https://visual-grounding-service-public.streamlit.app/)
+
 ## Capabilities
 
 - Natural-language target selection in uploaded images
