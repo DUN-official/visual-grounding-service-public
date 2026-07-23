@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Adaptive Visual Grounding</title>
+  <style>
+    :root { color-scheme: dark; font-family: Arial, sans-serif; }
+    body { max-width: 1120px; margin: 0 auto; padding: 24px; background: #111; color: #f5f5f5; }
+    h1 { margin-bottom: 4px; }
+    p.subtle, .hint { color: #aaa; }
+    .tabs { display: flex; gap: 10px; margin: 24px 0 18px; flex-wrap: wrap; }
+    button, select, input { font: inherit; }
+    button { cursor: pointer; border: 1px solid #777; border-radius: 10px; padding: 11px 18px; background: #666; color: white; font-weight: 700; }
+    button:hover { background: #777; }
+    button:disabled { opacity: .55; cursor: wait; }
+    .tabs button.active { background: #ececec; color: #111; }
+    .panel { border: 1px solid #3f3f3f; border-radius: 14px; padding: 20px; }
+    .panel[hidden] { display: none; }
+    form { display: grid; gap: 14px; }
+    label { display: grid; gap: 6px; font-weight: 700; }
+    input, select { box-sizing: border-box; width: 100%; padding: 11px; border: 1px solid #777; border-radius: 5px; background: #2d3748; color: white; }
+    input[type=file] { background: transparent; border: none; padding: 2px; }
+    .stage { position: relative; display: inline-block; max-width: 100%; margin-top: 18px; }
+    .stage img { display: block; max-width: 100%; border-radius: 9px; }
+    canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+    .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 16px 0; }
+    .card { border: 1px solid #444; border-radius: 12px; padding: 12px; min-height: 58px; }
+    .card small { display: block; color: #aaa; margin-bottom: 5px; }
+    progress { width: 100%; height: 16px; }
+    pre { max-height: 320px; overflow: auto; padding: 14px; border-radius: 10px; background: #242424; white-space: pre-wrap; }
+    video, .live-stream { width: 100%; max-height: 650px; background: #222; border-radius: 10px; }
+    .result { margin-top: 18px; }
+    .result[hidden] { display: none; }
+    a { color: #8dc8ff; }
+    .error { color: #ff8a8a; }
+    .ok { color: #8dffad; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 720px) {
+      .cards { grid-template-columns: 1fr 1fr; }
+      .row { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Adaptive Visual Grounding</h1>
+  <p class="subtle">Image grounding, recorded-video tracking, and best-effort live-camera tracking.</p>
+
+  <div class="tabs">
+    <button type="button" class="active" data-tab="imagePanel">Image</button>
+    <button type="button" data-tab="videoPanel">Recorded video</button>
+    <button type="button" data-tab="livePanel">Live camera</button>
+  </div>
+
+  <section id="imagePanel" class="panel">
+    <form id="imageForm">
+      <label>Image
+        <input id="imageInput" name="image" type="file" accept="image/jpeg,image/png,image/webp" required>
+      </label>
+      <label>Instruction
+        <input name="instruction" placeholder="find the toy car beside the green water bottle" required>
+      </label>
+      <label>Backend
+        <select name="preferred_backend">
+          <option value="">Auto</option>
+          <option value="yolo">YOLO</option>
+          <option value="owlvit">OWL-ViT</option>
+          <option value="gpt_guided_owlvit">GPT-guided OWL-ViT</option>
+        </select>
+      </label>
+      <label>Maximum results
+        <select name="maximum_results">
+          <option value="1" selected>1 — best match</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="5">5</option>
+          <option value="10">10</option>
+          <option value="25">25</option>
+        </select>
+      </label>
+      <label><input name="return_segmentation" type="checkbox" value="true"> Return segmentation mask overlay</label>
+      <button type="submit">Run image grounding</button>
+    </form>
+    <p id="imageStatus"></p>
+    <div class="stage"><img id="imagePreview"><canvas id="imageOverlay"></canvas></div>
+    <pre id="imageResult"></pre>
+  </section>
+
+  <section id="videoPanel" class="panel" hidden>
+    <form id="videoForm">
+      <label>Recorded video
+        <input name="video" type="file" accept="video/*" required>
+      </label>
+      <label>Tracking instruction
+        <input name="instruction" placeholder="track the toy car beside the green water bottle" required>
+      </label>
+      <label>Acquisition backend
+        <select name="backend">
+          <option value="auto" selected>Auto</option>
+          <option value="yolo">YOLO</option>
+          <option value="owlvit">OWL-ViT</option>
+          <option value="gpt_guided_owlvit">GPT-guided OWL-ViT</option>
+        </select>
+      </label>
+      <label><input name="use_segmentation" type="checkbox" value="true"> Overlay segmentation mask in the annotated output video</label>
+      <button id="videoSubmit" type="submit">Start video grounding</button>
+    </form>
+    <p id="videoStatus" class="hint"></p>
+    <progress id="videoProgress" value="0" max="1"></progress>
+    <div class="cards">
+      <div class="card"><small>Stage</small><strong id="videoPhase">—</strong></div>
+      <div class="card"><small>State</small><strong id="videoState">—</strong></div>
+      <div class="card"><small>Backend</small><strong id="videoBackend">—</strong></div>
+      <div class="card"><small>Model calls</small><strong id="videoCalls">0</strong></div>
+    </div>
+    <section id="videoResultSection" class="result" hidden>
+      <h3>Final annotated video</h3>
+      <video id="videoResult" controls playsinline preload="metadata"></video>
+      <p id="videoPlaybackMessage" class="hint"></p>
+      <p id="videoLinks"></p>
+      <details><summary>Processing summary</summary><pre id="videoSummary"></pre></details>
+    </section>
+  </section>
+
+  <section id="livePanel" class="panel" hidden>
+    <form id="liveForm">
+      <label>Tracking instruction
+        <input name="instruction" placeholder="track the toy car beside the green water bottle" required>
+      </label>
+      <label>Acquisition backend
+        <select name="backend">
+          <option value="auto" selected>Auto</option>
+          <option value="yolo">YOLO</option>
+          <option value="owlvit">OWL-ViT</option>
+          <option value="gpt_guided_owlvit">GPT-guided OWL-ViT</option>
+        </select>
+      </label>
+      <label><input name="use_segmentation" type="checkbox" value="true"> Overlay segmentation mask on the live camera stream</label>
+      <div class="row">
+        <button id="liveStart" type="submit">Start camera tracking</button>
+        <button id="liveStop" type="button" disabled>Stop camera</button>
+      </div>
+      <button id="liveReset" type="button" disabled>Reset and re-acquire target</button>
+    </form>
+    <p class="hint">The camera is opened by the local server at camera index 0. GPT-guided acquisition can take several seconds; keep the target visible and reasonably still until tracking begins.</p>
+    <p id="liveStatus"></p>
+    <div class="cards">
+      <div class="card"><small>State</small><strong id="liveState">—</strong></div>
+      <div class="card"><small>Backend</small><strong id="liveBackend">—</strong></div>
+      <div class="card"><small>Tracker</small><strong id="liveTracker">—</strong></div>
+      <div class="card"><small>Tracking FPS</small><strong id="liveFps">0</strong></div>
+    </div>
+    <img id="liveStream" class="live-stream" alt="Live annotated camera stream">
+  </section>
+
+<script>
+  const tabButtons = document.querySelectorAll("[data-tab]");
+  tabButtons.forEach(button => button.addEventListener("click", () => {
+    tabButtons.forEach(item => item.classList.toggle("active", item === button));
+    document.querySelectorAll(".panel").forEach(panel => {
+      panel.hidden = panel.id !== button.dataset.tab;
+    });
+  }));
+
+  const imageForm = document.getElementById("imageForm");
+  const imageInput = document.getElementById("imageInput");
+  const imagePreview = document.getElementById("imagePreview");
+  const imageOverlay = document.getElementById("imageOverlay");
+  imageInput.addEventListener("change", () => {
+    if (imageInput.files[0]) imagePreview.src = URL.createObjectURL(imageInput.files[0]);
+  });
+  imageForm.addEventListener("submit", async event => {
+    event.preventDefault();
+    document.getElementById("imageStatus").textContent = "Running…";
+    const data = new FormData(imageForm);
+    data.set("performance_mode", "balanced");
+    data.set("maximum_latency_ms", "200000");
+    if (!data.get("preferred_backend")) data.delete("preferred_backend");
+    try {
+      const response = await fetch("/v1/ground/upload", {method: "POST", body: data});
+      const payload = await response.json();
+      document.getElementById("imageResult").textContent = JSON.stringify(payload, null, 2);
+      const predictions = Array.isArray(payload.predictions) && payload.predictions.length
+        ? payload.predictions
+        : (payload.bbox_xyxy ? [{
+            bbox_xyxy: payload.bbox_xyxy,
+            confidence: payload.confidence,
+            label: null,
+          }] : []);
+      document.getElementById("imageStatus").textContent = response.ok
+        ? `${payload.status} · ${payload.backend_used || "none"} · ${predictions.length} result(s) · ${Number(payload.latency_ms || 0).toFixed(0)} ms`
+        : `Failed: ${payload.detail || response.status}`;
+
+      await imagePreview.decode();
+      imageOverlay.width = imagePreview.naturalWidth;
+      imageOverlay.height = imagePreview.naturalHeight;
+      const context = imageOverlay.getContext("2d");
+      context.clearRect(0, 0, imageOverlay.width, imageOverlay.height);
+      if (!response.ok || predictions.length === 0) return;
+
+      context.strokeStyle = "cyan";
+      context.fillStyle = "cyan";
+      context.font = `${Math.max(16, imageOverlay.width / 60)}px Arial`;
+      context.lineWidth = Math.max(3, imageOverlay.width / 300);
+      predictions.forEach((prediction, index) => {
+        const box = prediction.bbox_xyxy;
+        if (!box) return;
+        const segmentation = prediction?.metadata?.segmentation
+          || (index === 0 ? payload?.metadata?.segmentation : null);
+        if (segmentation && Array.isArray(segmentation.contours)) {
+          context.save();
+          context.globalAlpha = 0.28;
+          context.fillStyle = "#00ff88";
+          segmentation.contours.forEach(contour => {
+            if (!Array.isArray(contour) || contour.length < 3) return;
+            context.beginPath();
+            context.moveTo(contour[0][0], contour[0][1]);
+            contour.slice(1).forEach(point => context.lineTo(point[0], point[1]));
+            context.closePath();
+            context.fill();
+          });
+          context.restore();
+          context.strokeStyle = "#00ff88";
+          segmentation.contours.forEach(contour => {
+            if (!Array.isArray(contour) || contour.length < 3) return;
+            context.beginPath();
+            context.moveTo(contour[0][0], contour[0][1]);
+            contour.slice(1).forEach(point => context.lineTo(point[0], point[1]));
+            context.closePath();
+            context.stroke();
+          });
+          context.strokeStyle = "cyan";
+          context.fillStyle = "cyan";
+        }
+        context.strokeRect(
+          box.x_min,
+          box.y_min,
+          box.x_max - box.x_min,
+          box.y_max - box.y_min,
+        );
+        const confidence = Number(prediction.confidence);
+        const confidenceText = Number.isFinite(confidence)
+          ? ` ${(confidence * 100).toFixed(0)}%`
+          : "";
+        const label = prediction.label || `result ${index + 1}`;
+        context.fillText(
+          `${index + 1}: ${label}${confidenceText}`,
+          box.x_min,
+          Math.max(20, box.y_min - 8),
+        );
+      });
+    } catch (error) {
+      document.getElementById("imageStatus").textContent = `Failed: ${error}`;
+    }
+  });
+
+  const videoForm = document.getElementById("videoForm");
+  const videoSubmit = document.getElementById("videoSubmit");
+  let videoPollingTimer = null;
+  videoForm.addEventListener("submit", async event => {
+    event.preventDefault();
+    if (videoPollingTimer) clearInterval(videoPollingTimer);
+    videoSubmit.disabled = true;
+    document.getElementById("videoStatus").textContent = "Uploading video…";
+    document.getElementById("videoProgress").value = 0;
+    document.getElementById("videoResultSection").hidden = true;
+    const player = document.getElementById("videoResult");
+    player.pause();
+    player.removeAttribute("src");
+    player.load();
+    try {
+      const response = await fetch("/v1/video/upload", {method: "POST", body: new FormData(videoForm)});
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || response.status);
+      const sessionId = payload.session_id;
+      const poll = async () => {
+        const statusResponse = await fetch(`/v1/video/sessions/${sessionId}?t=${Date.now()}`, {cache: "no-store"});
+        const status = await statusResponse.json();
+        if (!statusResponse.ok) throw new Error(status.detail || statusResponse.status);
+        document.getElementById("videoPhase").textContent = (status.phase || status.status || "—").toUpperCase();
+        document.getElementById("videoState").textContent = status.state || status.final_state || "—";
+        document.getElementById("videoBackend").textContent = status.backend || status.requested_backend || "auto";
+        document.getElementById("videoCalls").textContent = status.model_calls || 0;
+        document.getElementById("videoProgress").value = Number(status.progress || (status.status === "completed" ? 1 : 0));
+        document.getElementById("videoStatus").textContent = status.error
+          ? `Failed: ${status.error}`
+          : `${status.phase || status.status || "processing"} · frame ${status.frame_index || 0}/${status.total_frames || "?"}`;
+
+        if (status.status === "completed" || status.status === "failed") {
+          clearInterval(videoPollingTimer);
+          videoSubmit.disabled = false;
+          document.getElementById("videoSummary").textContent = JSON.stringify(status, null, 2);
+          document.getElementById("videoResultSection").hidden = false;
+          const links = document.getElementById("videoLinks");
+          links.innerHTML =
+            `<a href="${status.video_url}" target="_blank">Open/download annotated video</a> · ` +
+            `<a href="${status.summary_url}" download>Summary JSON</a> · ` +
+            `<a href="${status.predictions_url}" download>Per-frame predictions</a>`;
+          if (status.status === "completed" && status.video_ready) {
+            player.src = `${status.video_url}?v=${sessionId}&t=${Date.now()}`;
+            player.load();
+            document.getElementById("videoPlaybackMessage").textContent = status.browser_video_compatible
+              ? "Browser-ready H.264 output loaded."
+              : "The output exists, but browser conversion failed. Use the open/download link.";
+          } else {
+            document.getElementById("videoPlaybackMessage").textContent = status.error || "Annotated video is not ready.";
+          }
+        }
+      };
+      await poll();
+      videoPollingTimer = setInterval(() => poll().catch(error => {
+        clearInterval(videoPollingTimer);
+        videoSubmit.disabled = false;
+        document.getElementById("videoStatus").textContent = `Status error: ${error}`;
+      }), 1500);
+    } catch (error) {
+      videoSubmit.disabled = false;
+      document.getElementById("videoStatus").textContent = `Failed: ${error}`;
+    }
+  });
+
+  const liveForm = document.getElementById("liveForm");
+  const liveStart = document.getElementById("liveStart");
+  const liveStop = document.getElementById("liveStop");
+  const liveReset = document.getElementById("liveReset");
+  const liveStream = document.getElementById("liveStream");
+  let liveSessionId = null;
+  let livePollingTimer = null;
+
+  liveForm.addEventListener("submit", async event => {
+    event.preventDefault();
+    if (livePollingTimer) clearInterval(livePollingTimer);
+    liveStart.disabled = true;
+    document.getElementById("liveStatus").textContent = "Starting camera…";
+    try {
+      const response = await fetch("/v1/live/start", {method: "POST", body: new FormData(liveForm)});
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || response.status);
+      liveSessionId = payload.session_id;
+      liveStop.disabled = false;
+      liveReset.disabled = false;
+      liveStream.src = `${payload.stream_url}?t=${Date.now()}`;
+      const poll = async () => {
+        const response = await fetch(`/v1/live/sessions/${liveSessionId}?t=${Date.now()}`, {cache: "no-store"});
+        const status = await response.json();
+        if (!response.ok) throw new Error(status.detail || response.status);
+        document.getElementById("liveState").textContent = status.state || "—";
+        document.getElementById("liveBackend").textContent = status.backend || "auto";
+        document.getElementById("liveTracker").textContent = status.tracker || "—";
+        document.getElementById("liveFps").textContent = status.tracking_fps || 0;
+        document.getElementById("liveStatus").textContent = status.message || status.status || "running";
+        if (["stopped", "failed"].includes(status.status)) {
+          clearInterval(livePollingTimer);
+          liveStart.disabled = false;
+          liveStop.disabled = true;
+          liveReset.disabled = true;
+        }
+      };
+      await poll();
+      livePollingTimer = setInterval(() => poll().catch(error => {
+        clearInterval(livePollingTimer);
+        liveStart.disabled = false;
+        liveStop.disabled = true;
+        liveReset.disabled = true;
+        document.getElementById("liveStatus").textContent = `Live status error: ${error}`;
+      }), 1000);
+    } catch (error) {
+      liveStart.disabled = false;
+      liveStop.disabled = true;
+      liveReset.disabled = true;
+      document.getElementById("liveStatus").textContent = `Failed: ${error}`;
+    }
+  });
+
+  liveReset.addEventListener("click", async () => {
+    if (!liveSessionId) return;
+    liveReset.disabled = true;
+    document.getElementById("liveStatus").textContent =
+      "Resetting tracker and reacquiring on the newest frame…";
+    try {
+      const response = await fetch(
+        `/v1/live/sessions/${liveSessionId}/reset`,
+        {method: "POST"},
+      );
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || response.status);
+      document.getElementById("liveState").textContent = "REACQUIRING";
+      document.getElementById("liveTracker").textContent = "—";
+      document.getElementById("liveStatus").textContent = payload.message;
+    } catch (error) {
+      document.getElementById("liveStatus").textContent = `Reset failed: ${error}`;
+    } finally {
+      liveReset.disabled = false;
+    }
+  });
+
+  liveStop.addEventListener("click", async () => {
+    if (!liveSessionId) return;
+    liveStop.disabled = true;
+    liveReset.disabled = true;
+    await fetch(`/v1/live/sessions/${liveSessionId}/stop`, {method: "POST"});
+    document.getElementById("liveStatus").textContent = "Stopping camera…";
+  });
+</script>
+</body>
+</html>

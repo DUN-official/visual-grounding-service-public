@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments and secrets
+.venv/
+venv/
+.env
+.streamlit/secrets.toml
+
+# Runtime outputs
+runtime/
+logs/
+
+# Model weights and caches
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.ckpt
+models/**/snapshots/
+models/**/.cache/
+models/yolo/
+models/owlvit/
+.cache/
+
+# Build output
+build/
+dist/
+
+# Local media and archives
+*.zip
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary and backup files
+*.before_*
+*.bak
+*.tmp
+*~

@@ -1,0 +1,89 @@
+{
+  "service": {
+    "project_root": "..",
+    "request_log": "runtime/logs/grounding_requests.jsonl",
+    "allowed_image_roots": [],
+    "max_image_bytes": 31457280,
+    "fail_startup_when_no_backend": true
+  },
+  "router": {
+    "yolo_target_aliases": {
+      "person": ["man", "woman", "human", "people"],
+      "chair": ["seat"],
+      "couch": ["sofa"],
+      "dining table": ["table"],
+      "potted plant": ["plant"],
+      "bottle": ["water bottle"],
+      "backpack": ["bag", "rucksack"],
+      "handbag": ["bag", "purse"]
+    },
+    "remote_fallback_enabled": false,
+    "guided_fallback_to_owlvit": true
+  },
+  "backends": {
+    "yolo": {
+      "enabled": true,
+      "weights_path": "models/yolo/detector.pt",
+      "confidence_threshold": 0.25,
+      "image_size": 640,
+      "device": "auto",
+      "max_candidates": 20,
+      "warmup_on_startup": false,
+      "class_aliases": {
+        "person": ["man", "woman", "human", "people"],
+        "chair": ["seat"],
+        "couch": ["sofa"],
+        "dining table": ["table"],
+        "potted plant": ["plant"],
+        "bottle": ["water bottle"],
+        "backpack": ["bag", "rucksack"],
+        "handbag": ["bag", "purse"]
+      }
+    },
+    "owlvit": {
+      "enabled": true,
+      "model_path": "models/owlvit/owlvit-base-patch32",
+      "device": "auto",
+      "thresholds": [0.05, 0.02, 0.01, 0.005],
+      "top_k": 6,
+      "max_pairwise_iou": 0.85,
+      "max_image_width": 960,
+      "use_fp16": true,
+      "warmup_on_startup": false
+    },
+    "gpt_guided_owlvit": {
+      "enabled": true,
+      "openai_model": "gpt-5",
+      "api_key_env": "OPENAI_API_KEY",
+      "allow_session_api_key": true,
+      "image_detail": "low",
+      "top_k_initial": 6,
+      "top_k_refined": 4,
+      "local_crop_margin": 0.2,
+      "use_yolo_first": true,
+      "enable_local_geometry": true,
+      "local_geometry_min_score": 0.72,
+      "local_geometry_min_margin": 0.12,
+      "single_candidate_confidence": 0.72,
+      "skip_gpt_when_unambiguous": true,
+      "gpt_image_max_width": 1024,
+      "gpt_jpeg_quality": 78,
+      "openai_timeout_seconds": 20.0,
+      "openai_max_retries": 1,
+      "maximum_edge_adjustment": 0.1,
+      "maximum_edge_contraction": 0.06,
+      "minimum_adjustment_confidence": 0.65,
+      "minimum_adjusted_box_overlap": 0.55,
+      "minimum_adjusted_area_ratio": 0.8,
+      "maximum_adjusted_area_ratio": 1.6,
+      "default_box_padding": 0.04,
+      "debug_output_dir": null
+    },
+    "remote": {
+      "enabled": false,
+      "endpoint": "http://127.0.0.1:8000",
+      "api_key_env": null,
+      "healthcheck": true
+    }
+  }
+}
