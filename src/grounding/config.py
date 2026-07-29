@@ -36,26 +36,42 @@ class OwlViTSettings(BackendBaseSettings):
     max_image_width: int = 960
     use_fp16: bool = True
     warmup_on_startup: bool = True
+    prompt_aliases: dict[str, list[str]] = Field(
+        default_factory=lambda: {
+            "package": ["parcel", "box", "cardboard box", "delivery package"],
+            "person": ["human"],
+            "door": ["apartment door"],
+            "elevator button panel": [
+                "elevator panel",
+                "button panel",
+                "elevator button",
+            ],
+        }
+    )
 
 
 class GPTGuidedSettings(BackendBaseSettings):
     openai_model: str = "gpt-5"
     api_key_env: str = "OPENAI_API_KEY"
     allow_session_api_key: bool = False
-    image_detail: str = "low"
-    top_k_initial: int = 6
-    top_k_refined: int = 4
-    local_crop_margin: float = 0.20
+    image_detail: str = "high"
+    top_k_initial: int = 5
+    top_k_refined: int = 5
+    local_crop_margin: float = 0.25
     use_yolo_first: bool = True
     enable_local_geometry: bool = True
     local_geometry_min_score: float = 0.72
     local_geometry_min_margin: float = 0.12
     single_candidate_confidence: float = 0.72
     skip_gpt_when_unambiguous: bool = True
-    gpt_image_max_width: int = 1024
-    gpt_jpeg_quality: int = 78
-    openai_timeout_seconds: float = 20.0
+    gpt_image_max_width: int = 1600
+    gpt_jpeg_quality: int = 92
+    openai_timeout_seconds: float = 60.0
     openai_max_retries: int = 1
+    quality_thresholds: list[float] = Field(
+        default_factory=lambda: [0.05, 0.02, 0.01, 0.005, 0.0]
+    )
+    quality_use_original_image: bool = True
     maximum_edge_adjustment: float = 0.10
     maximum_edge_contraction: float = 0.06
     minimum_adjustment_confidence: float = 0.65

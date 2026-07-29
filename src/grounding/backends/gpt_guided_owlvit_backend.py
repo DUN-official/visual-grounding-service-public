@@ -21,26 +21,30 @@ from ..task_parser import normalize_text
 
 
 class GPTGuidedOWLViTBackend(GroundingBackend):
-    """Adaptive guided cascade with zero or one GPT vision call per request.
+    """Mode-aware guided grounding with bounded visual refinement.
 
     Fast path:
         one YOLO scene pass -> local relation scoring -> return
     Open-vocabulary path:
         one OWL ViT pass -> local relation scoring -> return when decisive
-    Ambiguous path:
+    Balanced path:
         candidate generation -> one combined GPT selection/edge decision
+    Quality path:
+        OWL ViT candidates -> GPT selection or coarse region -> local OWL ViT
+        refinement -> GPT refined selection -> bounded GPT edge review
     """
 
     def __init__(
         self, *, owlvit_backend, yolo_backend=None, openai_model,
         api_key_env="OPENAI_API_KEY", allow_session_api_key=False,
-        image_detail="low",
-        top_k_initial=6, top_k_refined=4, local_crop_margin=0.20,
+        image_detail="high",
+        top_k_initial=5, top_k_refined=5, local_crop_margin=0.25,
         use_yolo_first=True, enable_local_geometry=True,
         local_geometry_min_score=0.72, local_geometry_min_margin=0.12,
         single_candidate_confidence=0.72, skip_gpt_when_unambiguous=True,
-        gpt_image_max_width=1024, gpt_jpeg_quality=78,
-        openai_timeout_seconds=20.0, openai_max_retries=1,
+        gpt_image_max_width=1600, gpt_jpeg_quality=92,
+        openai_timeout_seconds=60.0, openai_max_retries=1,
+        quality_thresholds=None, quality_use_original_image=True,
         maximum_edge_adjustment=0.10, maximum_edge_contraction=0.06,
         minimum_adjustment_confidence=0.65,
         minimum_adjusted_box_overlap=0.55,
@@ -70,6 +74,8 @@ class GPTGuidedOWLViTBackend(GroundingBackend):
         self.gpt_jpeg_quality = gpt_jpeg_quality
         self.openai_timeout_seconds = openai_timeout_seconds
         self.openai_max_retries = openai_max_retries
+        self.quality_thresholds = quality_thresholds or [0.05, 0.02, 0.01, 0.005, 0.0]
+        self.quality_use_original_image = bool(quality_use_original_image)
         self.maximum_edge_adjustment = maximum_edge_adjustment
         self.maximum_edge_contraction = maximum_edge_contraction
         self.minimum_adjustment_confidence = minimum_adjustment_confidence
@@ -100,7 +106,7 @@ class GPTGuidedOWLViTBackend(GroundingBackend):
         self._started = True
         credential_mode = "server key" if api_key else "session key required"
         self._health_detail = (
-            "adaptive guided cascade ready; one GPT call maximum; "
+            "fast, balanced, and quality grounding paths ready; "
             f"YOLO fast path {yolo_state}; {credential_mode}"
         )
         self._model_reference = self.openai_model
@@ -151,6 +157,14 @@ class GPTGuidedOWLViTBackend(GroundingBackend):
             stage="image_decode", duration_ms=timings["image_decode"],
             data={"image_size": [image.width, image.height]},
         ))
+
+        if request.performance_mode in {PerformanceMode.QUALITY, PerformanceMode.ACCURATE}:
+            return self._quality_ground(
+                request=request,
+                image=image,
+                trace=trace,
+                timings=timings,
+            )
 
         candidates = []
         anchors_by_name = {}
@@ -354,6 +368,202 @@ class GPTGuidedOWLViTBackend(GroundingBackend):
             and self.yolo_backend.supports_target(request.target_object)
         )
 
+    def _quality_ground(self, *, request, image, trace, timings):
+        pipeline_path = ["owlvit_initial"]
+        gpt_request_count = 0
+
+        initial_started = time.perf_counter()
+        initial_candidates = self.owlvit_backend.detect_candidates(
+            request,
+            image=image,
+            top_k=self.top_k_initial,
+            thresholds=self.quality_thresholds,
+            use_original_size=self.quality_use_original_image,
+        )
+        timings["owlvit_initial"] = self._elapsed(initial_started)
+        initial_overlay = self._candidate_overlay(image, initial_candidates, {})
+        trace.append(
+            TraceEvent(
+                stage="owlvit_initial_candidates",
+                duration_ms=timings["owlvit_initial"],
+                message=f"generated {len(initial_candidates)} quality candidates",
+                data={
+                    "candidate_count": len(initial_candidates),
+                    "thresholds": self.quality_thresholds,
+                    "original_size_inference": self.quality_use_original_image,
+                },
+            )
+        )
+
+        select_started = time.perf_counter()
+        initial_decision = self._gpt_quality_selection(
+            request,
+            initial_overlay,
+            initial_candidates,
+            allow_region=True,
+            stage="initial",
+        )
+        timings["gpt_initial_selection"] = self._elapsed(select_started)
+        gpt_request_count += 1
+        pipeline_path.append("gpt_initial_selection")
+        trace.append(
+            TraceEvent(
+                stage="gpt_initial_selection",
+                duration_ms=timings["gpt_initial_selection"],
+                message=str(initial_decision.get("reason", "")),
+                data=initial_decision,
+            )
+        )
+
+        selected_initial = self._quality_candidate(initial_candidates, initial_decision)
+        refinement_seed = (
+            selected_initial.bbox_xyxy
+            if selected_initial is not None
+            else self._quality_region(initial_decision, image.width, image.height)
+        )
+        if refinement_seed is None:
+            return GroundingResult.failure(
+                request,
+                status=GroundingStatus.CLARIFICATION_REQUIRED,
+                backend_used=self.name,
+                message="quality selection found neither a valid candidate nor a refinement region",
+                clarification_required=True,
+                trace=trace,
+            )
+
+        crop_box = self._expanded_crop(refinement_seed, image.width, image.height)
+        crop = image.crop(tuple(int(round(value)) for value in crop_box.as_list()))
+        refine_started = time.perf_counter()
+        local_candidates = self.owlvit_backend.detect_candidates(
+            request,
+            image=crop,
+            top_k=self.top_k_refined,
+            thresholds=self.quality_thresholds,
+            use_original_size=self.quality_use_original_image,
+        )
+        refined_candidates = [
+            GroundingCandidate(
+                candidate_id=f"refined_{index}",
+                bbox_xyxy=BBoxXYXY(
+                    x_min=item.bbox_xyxy.x_min + crop_box.x_min,
+                    y_min=item.bbox_xyxy.y_min + crop_box.y_min,
+                    x_max=item.bbox_xyxy.x_max + crop_box.x_min,
+                    y_max=item.bbox_xyxy.y_max + crop_box.y_min,
+                ).clipped(image.width, image.height),
+                confidence=item.confidence,
+                label=item.label,
+                source=item.source,
+                metadata={**item.metadata, "quality_crop": crop_box.as_list()},
+            )
+            for index, item in enumerate(local_candidates, start=1)
+        ]
+        timings["owlvit_local_refinement"] = self._elapsed(refine_started)
+        pipeline_path.append("owlvit_local_refinement")
+        trace.append(
+            TraceEvent(
+                stage="owlvit_local_refinement",
+                duration_ms=timings["owlvit_local_refinement"],
+                message=f"generated {len(refined_candidates)} refined candidates",
+                data={"crop": crop_box.as_list()},
+            )
+        )
+
+        selected = selected_initial
+        selection_decision = initial_decision
+        if refined_candidates:
+            refined_overlay = self._candidate_overlay(image, refined_candidates, {})
+            refined_started = time.perf_counter()
+            refined_decision = self._gpt_quality_selection(
+                request,
+                refined_overlay,
+                refined_candidates,
+                allow_region=False,
+                stage="refined",
+            )
+            timings["gpt_refined_selection"] = self._elapsed(refined_started)
+            gpt_request_count += 1
+            pipeline_path.append("gpt_refined_selection")
+            trace.append(
+                TraceEvent(
+                    stage="gpt_refined_selection",
+                    duration_ms=timings["gpt_refined_selection"],
+                    message=str(refined_decision.get("reason", "")),
+                    data=refined_decision,
+                )
+            )
+            refined_selected = self._quality_candidate(refined_candidates, refined_decision)
+            if refined_selected is not None:
+                selected = refined_selected
+                selection_decision = refined_decision
+
+        if selected is None:
+            return GroundingResult.failure(
+                request,
+                status=GroundingStatus.CLARIFICATION_REQUIRED,
+                backend_used=self.name,
+                message="quality refinement produced no selectable target candidate",
+                clarification_required=True,
+                trace=trace,
+            )
+
+        edge_image = self._edge_review_image(image, selected.bbox_xyxy)
+        edge_started = time.perf_counter()
+        edge_decision = self._gpt_quality_edge_review(request, edge_image)
+        timings["gpt_edge_review"] = self._elapsed(edge_started)
+        gpt_request_count += 1
+        pipeline_path.append("gpt_edge_review")
+        final_box, adjustment_applied, adjustment_gate = self._apply_safe_adjustment(
+            selected.bbox_xyxy,
+            edge_decision,
+            image.width,
+            image.height,
+        )
+        trace.append(
+            TraceEvent(
+                stage="gpt_edge_review",
+                duration_ms=timings["gpt_edge_review"],
+                message=adjustment_gate,
+                data={**edge_decision, "adjustment_applied": adjustment_applied},
+            )
+        )
+
+        confidence = float(
+            selection_decision.get("confidence", selected.confidence)
+            or selected.confidence
+        )
+        relation_match = selection_decision.get("relation_match")
+        prediction = GroundingPrediction(
+            bbox_xyxy=final_box,
+            confidence=max(0.0, min(1.0, confidence)),
+            label=selected.label,
+            relation_match=relation_match,
+            candidate_id=selected.candidate_id,
+            metadata={"source": selected.source},
+        )
+        final_overlay = self._prediction_overlay(image, [prediction])
+        self._save_debug(request, initial_overlay, final_overlay)
+        return GroundingResult(
+            request_id=request.request_id,
+            status=GroundingStatus.SUCCESS,
+            bbox_xyxy=prediction.bbox_xyxy,
+            predictions=[prediction],
+            confidence=prediction.confidence,
+            relation_match=relation_match,
+            backend_used=self.name,
+            candidates=refined_candidates or initial_candidates,
+            trace=trace,
+            metadata={
+                "performance_profile": "quality",
+                "pipeline_path": pipeline_path,
+                "gpt_request_count": gpt_request_count,
+                "stage_latencies_ms": timings,
+                "initial_candidate_count": len(initial_candidates),
+                "refined_candidate_count": len(refined_candidates),
+                "adjustment_applied": adjustment_applied,
+                "adjustment_gate": adjustment_gate,
+            },
+        )
+
     def _local_fast_selection(self, request, candidates, ranked):
         no_attributes = not request.attributes
         plural = request.quantity in {QuantityIntent.MULTIPLE, QuantityIntent.ALL}
@@ -415,6 +625,140 @@ class GPTGuidedOWLViTBackend(GroundingBackend):
                 "returned_count": len(predictions),
             },
         )
+
+    def _gpt_quality_selection(
+        self,
+        request,
+        image,
+        candidates,
+        *,
+        allow_region,
+        stage,
+    ):
+        lines = "\n".join(
+            f"C{index}: label={candidate.label}, "
+            f"detector_confidence={candidate.confidence:.4f}, "
+            f"box={candidate.bbox_xyxy.as_list()}"
+            for index, candidate in enumerate(candidates, start=1)
+        ) or "No detector candidate is available."
+        prompt = f"""Return exactly one JSON object and no markdown.
+
+Instruction: {request.instruction}
+Target phrase: {request.target_phrase or request.target_object or 'object'}
+Target attributes: {json.dumps(request.attributes)}
+Excluded attributes: {json.dumps(request.metadata.get('negated_attributes', []))}
+Spatial constraints: {json.dumps([item.model_dump(mode='json') for item in request.relations])}
+Selection stage: {stage}
+
+The image may contain cyan candidates C1, C2, and so on.
+{lines}
+
+Select the candidate satisfying the complete instruction. Do not select an
+anchor or a distinctive subsection of the target. If no candidate is suitable
+and allow_region={str(bool(allow_region)).lower()}, return a coarse target region
+in full-image pixel coordinates for another detector pass. Do not invent a
+region when the target cannot be located.
+
+Schema:
+{{
+  "status": "selected" or "refine" or "failed",
+  "selected_candidate": integer or null,
+  "region": [x_min, y_min, x_max, y_max] or null,
+  "confidence": number from 0 to 1,
+  "relation_match": true or false,
+  "reason": "short explanation"
+}}"""
+        return self._vision_json(prompt, image)
+
+    @staticmethod
+    def _quality_candidate(candidates, decision):
+        if decision.get("status") != "selected":
+            return None
+        value = decision.get("selected_candidate")
+        if value is None and isinstance(decision.get("selected_candidates"), list):
+            entries = decision["selected_candidates"]
+            value = entries[0].get("candidate") if entries else None
+        try:
+            index = int(value) - 1
+        except (TypeError, ValueError):
+            return None
+        return candidates[index] if 0 <= index < len(candidates) else None
+
+    @staticmethod
+    def _quality_region(decision, image_width, image_height):
+        if decision.get("status") != "refine":
+            return None
+        region = decision.get("region")
+        if not isinstance(region, list) or len(region) != 4:
+            return None
+        try:
+            values = [float(value) for value in region]
+        except (TypeError, ValueError):
+            return None
+        if max(abs(value) for value in values) <= 1.5:
+            values = [
+                values[0] * image_width,
+                values[1] * image_height,
+                values[2] * image_width,
+                values[3] * image_height,
+            ]
+        try:
+            return BBoxXYXY(
+                x_min=values[0],
+                y_min=values[1],
+                x_max=values[2],
+                y_max=values[3],
+            ).clipped(image_width, image_height)
+        except ValueError:
+            return None
+
+    def _gpt_quality_edge_review(self, request, image):
+        prompt = f"""Return exactly one JSON object and no markdown.
+
+Instruction: {request.instruction}
+The cyan box already identifies the selected target. Review only whether its
+four edges enclose the entire visible target without excessive background.
+Never contract the box around a face, torso, handle, label, logo, or another
+subsection. Use accept when no small correction is clearly justified.
+
+Each shift is a fraction of the current box width or height and must be between
+-{self.maximum_edge_adjustment:.2f} and {self.maximum_edge_adjustment:.2f}.
+
+Schema:
+{{
+  "decision": "accept" or "adjust" or "uncertain",
+  "confidence": number from 0 to 1,
+  "left_shift": number,
+  "top_shift": number,
+  "right_shift": number,
+  "bottom_shift": number,
+  "reason": "short explanation"
+}}"""
+        decision = self._vision_json(prompt, image)
+        if decision.get("decision") != "adjust":
+            decision.update(
+                {
+                    "left_shift": 0.0,
+                    "top_shift": 0.0,
+                    "right_shift": 0.0,
+                    "bottom_shift": 0.0,
+                }
+            )
+        return decision
+
+    @staticmethod
+    def _edge_review_image(image, box):
+        review = box.padded(0.35, image.width, image.height)
+        crop = image.crop(tuple(int(round(value)) for value in review.as_list()))
+        draw = ImageDraw.Draw(crop)
+        relative = [
+            box.x_min - review.x_min,
+            box.y_min - review.y_min,
+            box.x_max - review.x_min,
+            box.y_max - review.y_min,
+        ]
+        draw.rectangle(relative, outline="cyan", width=6)
+        return crop
 
     def _gpt_final_decision(self, request, image, candidates):
         lines = "\n".join(

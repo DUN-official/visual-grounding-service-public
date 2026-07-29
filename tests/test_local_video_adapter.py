@@ -44,3 +44,34 @@ def test_local_adapter_builds_frame_request(monkeypatch):
     assert observation.bbox_xyxy == (1.0, 2.0, 20.0, 30.0)
     assert service.request.preferred_backend == "owlvit"
     assert service.request.metadata["input_mode"] == "video_frame"
+
+
+def test_local_adapter_propagates_profile_without_reparsing(monkeypatch):
+    monkeypatch.setattr(service_adapter, "_encode_frame", lambda frame, quality: b"jpeg")
+    prepared = {}
+
+    def prepare_backend(preferred, instruction, **kwargs):
+        prepared.update(
+            preferred=preferred,
+            instruction=instruction,
+            **kwargs,
+        )
+
+    service = _Service()
+    adapter = LocalGroundingServiceAdapter(
+        service,
+        api_key="session-key",
+        prepare_backend=prepare_backend,
+    )
+
+    adapter.ground_frame(
+        object(),
+        instruction="find the package beside the chair",
+        preferred_backend="gpt_guided_owlvit",
+        performance_mode="quality",
+    )
+
+    assert service.request.performance_mode == "quality"
+    assert service.request.metadata["parser_mode"] == "local"
+    assert prepared["performance_mode"] == "quality"
+    assert prepared["api_key"] == "session-key"

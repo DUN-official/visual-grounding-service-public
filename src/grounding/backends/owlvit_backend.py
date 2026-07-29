@@ -19,7 +19,7 @@ class OwlViTBackend(GroundingBackend):
     def __init__(
         self, *, model_path, device="auto", thresholds=None, top_k=5,
         max_pairwise_iou=0.85, max_image_width=960, use_fp16=True,
-        warmup_on_startup=True, allowed_image_roots=None,
+        warmup_on_startup=True, prompt_aliases=None, allowed_image_roots=None,
         max_image_bytes=30 * 1024 * 1024,
     ):
         super().__init__("owlvit")
@@ -31,6 +31,10 @@ class OwlViTBackend(GroundingBackend):
         self.max_image_width = max_image_width
         self.use_fp16 = use_fp16
         self.warmup_on_startup = warmup_on_startup
+        self.prompt_aliases = {
+            normalize_text(key): list(values)
+            for key, values in (prompt_aliases or {}).items()
+        }
         self.allowed_image_roots = allowed_image_roots
         self.max_image_bytes = max_image_bytes
         self._processor = None
@@ -120,7 +124,17 @@ class OwlViTBackend(GroundingBackend):
             metadata={"stage_latencies_ms": {"image_decode": decode_ms, "owlvit": inference_ms}},
         )
 
-    def detect_candidates(self, request, *, image=None, labels=None, top_k=None, max_image_width=None):
+    def detect_candidates(
+        self,
+        request,
+        *,
+        image=None,
+        labels=None,
+        top_k=None,
+        max_image_width=None,
+        thresholds=None,
+        use_original_size=False,
+    ):
         if not self._started:
             raise RuntimeError("OWL ViT is not started")
         image = image or load_pil_image(
@@ -129,8 +143,13 @@ class OwlViTBackend(GroundingBackend):
             max_bytes=self.max_image_bytes,
         )
         original_width, original_height = image.width, image.height
+        inference_width = (
+            None
+            if use_original_size
+            else self.max_image_width if max_image_width is None else max_image_width
+        )
         inference_image, scale_x, scale_y = resize_for_inference(
-            image, self.max_image_width if max_image_width is None else max_image_width
+            image, inference_width
         )
         labels = labels or self._labels_for_request(request)
         labels = [x for x in dict.fromkeys(x.strip() for x in labels) if x] or ["object"]
@@ -147,7 +166,7 @@ class OwlViTBackend(GroundingBackend):
                 outputs = self._model(**inputs)
 
         collected = []
-        for threshold in self.thresholds:
+        for threshold in thresholds or self.thresholds:
             processed = self._processor.post_process_grounded_object_detection(
                 outputs,
                 threshold=float(threshold),
@@ -197,8 +216,7 @@ class OwlViTBackend(GroundingBackend):
             return nullcontext()
         return self._torch.autocast(device_type="cuda", dtype=self._torch.float16)
 
-    @staticmethod
-    def _labels_for_request(request):
+    def _labels_for_request(self, request):
         target = normalize_text(request.target_object) or "object"
         labels = [target]
         if request.target_phrase and normalize_text(request.target_phrase) != target:
@@ -207,9 +225,21 @@ class OwlViTBackend(GroundingBackend):
             labels.append(" ".join([*request.attributes, target]))
         if request.location_hint:
             labels.append(f"{target} {request.location_hint}")
+        metadata = request.metadata if isinstance(request.metadata, dict) else {}
+        labels.extend(metadata.get("candidate_prompts", []))
+        for canonical, aliases in self.prompt_aliases.items():
+            normalized_aliases = {normalize_text(item) for item in aliases}
+            if target == canonical or target in normalized_aliases:
+                labels.extend([canonical, *aliases])
         if normalize_text(request.instruction) not in [normalize_text(x) for x in labels]:
             labels.append(request.instruction)
-        return labels
+        return list(
+            dict.fromkeys(
+                value.strip()
+                for value in labels
+                if isinstance(value, str) and value.strip()
+            )
+        )[:12]
 
 
 class _WarmupRequest:

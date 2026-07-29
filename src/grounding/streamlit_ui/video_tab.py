@@ -9,8 +9,9 @@ from uuid import uuid4
 import streamlit as st
 
 from ..openai_context import use_openai_api_key
+from ..schemas import PerformanceMode
 from ..video.processor import VideoGroundingProcessor
-from .image_tab import BACKENDS
+from .image_tab import BACKENDS, MODE_LATENCY_MS, PERFORMANCE_MODES
 from .runtime import ServiceRuntime
 
 
@@ -28,6 +29,15 @@ def render_video_tab(runtime: ServiceRuntime, *, api_key: str | None = None) -> 
             "Instruction",
             placeholder="Track the package beside the table",
             key="video-instruction",
+        )
+        mode_label = st.selectbox(
+            "Profile",
+            list(PERFORMANCE_MODES),
+            help=(
+                "The selected profile is used for initial acquisition and every "
+                "subsequent re-acquisition; tracking between calls remains local."
+            ),
+            key="video-performance-mode",
         )
         backend_label = st.selectbox("Backend", list(BACKENDS), key="video-backend")
         segmentation = st.checkbox(
@@ -47,7 +57,17 @@ def render_video_tab(runtime: ServiceRuntime, *, api_key: str | None = None) -> 
         if not instruction.strip():
             st.error("Enter an instruction before processing.")
             return
-        if BACKENDS[backend_label] == "gpt_guided_owlvit" and not api_key:
+        performance_mode = PERFORMANCE_MODES[mode_label]
+        if performance_mode == PerformanceMode.QUALITY and BACKENDS[backend_label] not in {
+            None,
+            "gpt_guided_owlvit",
+        }:
+            st.error("Quality profile requires Auto or GPT-guided OWL-ViT as the backend.")
+            return
+        if (
+            performance_mode == PerformanceMode.QUALITY
+            or BACKENDS[backend_label] == "gpt_guided_owlvit"
+        ) and not api_key:
             st.error("Enter an OpenAI API key in the sidebar to use GPT-guided OWL-ViT.")
             return
         _process_video(
@@ -55,6 +75,7 @@ def render_video_tab(runtime: ServiceRuntime, *, api_key: str | None = None) -> 
             uploaded=uploaded,
             instruction=instruction.strip(),
             backend=BACKENDS[backend_label],
+            performance_mode=performance_mode,
             segmentation=segmentation,
             api_key=api_key,
         )
@@ -70,6 +91,7 @@ def _process_video(
     uploaded,
     instruction: str,
     backend: str | None,
+    performance_mode: PerformanceMode,
     segmentation: bool,
     api_key: str | None,
 ) -> None:
@@ -115,13 +137,14 @@ def _process_video(
                 source=str(upload_path),
                 instruction=instruction,
                 preferred_backend=backend,
-                maximum_latency_ms=200_000,
+                maximum_latency_ms=MODE_LATENCY_MS[performance_mode],
                 save_video=True,
                 display=False,
                 session_name=session_id,
                 progress_callback=report,
                 use_llm_parser=True,
                 use_segmentation=segmentation,
+                performance_mode=performance_mode.value,
             )
         progress.progress(1.0, text="Completed")
         st.session_state["video-result"] = summary

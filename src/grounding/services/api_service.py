@@ -175,6 +175,7 @@ def create_app(config_path: str | Path | None = None):
         maximum_results: int | None = Form(default=None),
         maximum_latency_ms: int = Form(default=200_000),
         preferred_backend: str | None = Form(default=None),
+        parser_mode: str = Form(default="llm"),
         return_segmentation: bool = Form(default=False),
     ):
         media_type = (image.content_type or "").lower()
@@ -207,6 +208,7 @@ def create_app(config_path: str | Path | None = None):
             "metadata": {
                 "uploaded_filename": image.filename,
                 "input_mode": "multipart_upload",
+                "parser_mode": parser_mode,
                 "return_segmentation": bool(return_segmentation),
             },
         }

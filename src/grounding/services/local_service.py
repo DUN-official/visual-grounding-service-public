@@ -6,12 +6,21 @@ import time
 
 from ..backends import GPTGuidedOWLViTBackend, OwlViTBackend, RemoteBackend, YoloBackend
 from ..image_utils import load_pil_image
+from ..llm_task_parser import parse_task_with_service
 from ..segmentation import segment_from_box
 from ..config import GroundingConfig, project_path
 from ..evaluation.logger import GroundingJSONLLogger
 from ..interface import GroundingBackend
 from ..router import GroundingRouter
-from ..schemas import GroundingRequest, GroundingResult, GroundingStatus, TraceEvent
+from ..schemas import (
+    GroundingRequest,
+    GroundingResult,
+    GroundingStatus,
+    QuantityIntent,
+    ReasoningComplexity,
+    SpatialConstraint,
+    TraceEvent,
+)
 from ..task_parser import parse_grounding_prompt
 
 
@@ -59,6 +68,7 @@ class LocalGroundingService:
                 max_image_width=settings.max_image_width,
                 use_fp16=settings.use_fp16,
                 warmup_on_startup=settings.warmup_on_startup,
+                prompt_aliases=settings.prompt_aliases,
                 allowed_image_roots=allowed_roots,
                 max_image_bytes=max_bytes,
             )
@@ -88,6 +98,8 @@ class LocalGroundingService:
                 gpt_jpeg_quality=settings.gpt_jpeg_quality,
                 openai_timeout_seconds=settings.openai_timeout_seconds,
                 openai_max_retries=settings.openai_max_retries,
+                quality_thresholds=settings.quality_thresholds,
+                quality_use_original_image=settings.quality_use_original_image,
                 maximum_edge_adjustment=settings.maximum_edge_adjustment,
                 maximum_edge_contraction=settings.maximum_edge_contraction,
                 minimum_adjustment_confidence=settings.minimum_adjustment_confidence,
@@ -152,21 +164,74 @@ class LocalGroundingService:
 
     def prepare_request(self, request: GroundingRequest):
         started = time.perf_counter()
-        parsed = parse_grounding_prompt(request.instruction)
+        local = parse_grounding_prompt(request.instruction)
+        source_metadata = dict(request.metadata)
+        parser_mode = str(source_metadata.get("parser_mode") or "llm").lower()
+        if source_metadata.get("input_mode") == "video_frame":
+            parser_mode = "local"
+        structured = parse_task_with_service(
+            self,
+            request.instruction,
+            parser_mode=parser_mode,
+        )
+
+        structured_relations = [
+            SpatialConstraint(
+                relation=str(item.get("relation") or "").strip(),
+                anchor=str(item.get("anchor_object") or "").strip(),
+                raw_text=str(item.get("raw_text") or "").strip(),
+            )
+            for item in structured.relations
+            if str(item.get("relation") or "").strip()
+            and str(item.get("anchor_object") or "").strip()
+        ]
+        try:
+            structured_quantity = QuantityIntent(structured.quantity)
+        except ValueError:
+            structured_quantity = local.quantity
+        try:
+            structured_complexity = ReasoningComplexity(structured.reasoning_complexity)
+        except ValueError:
+            structured_complexity = local.reasoning_complexity
+
+        relations = structured_relations or list(local.relations)
+        attributes = list(dict.fromkeys([*structured.attributes, *local.attributes]))
+        anchors = list(dict.fromkeys([*structured.anchor_objects, *local.anchor_objects]))
+        quantity = (
+            structured_quantity
+            if structured_quantity != QuantityIntent.UNKNOWN
+            else local.quantity
+        )
+        minimum_count = max(local.minimum_count, structured.minimum_count)
+        inferred_maximum = (
+            10 if quantity in {QuantityIntent.MULTIPLE, QuantityIntent.ALL} else 1
+        )
+        guidance_reasons = list(local.guidance_reasons)
+        if structured.negated_attributes:
+            guidance_reasons.append("negation")
+        if structured.parser_confidence < 0.65:
+            guidance_reasons.append("low_parser_confidence")
+        guidance_reasons = list(dict.fromkeys(guidance_reasons))
+
         updates = {}
         inferred = {
-            "target_object": parsed.target_object,
-            "target_phrase": parsed.target_phrase,
-            "location_hint": parsed.location_hint,
-            "action": parsed.action,
-            "quantity": parsed.quantity,
-            "minimum_count": parsed.minimum_count,
-            "maximum_results": parsed.maximum_results,
-            "attributes": parsed.attributes,
-            "relations": parsed.relations,
-            "anchor_objects": parsed.anchor_objects,
-            "reasoning_complexity": parsed.reasoning_complexity,
-            "requires_guided_reasoning": parsed.requires_guided_reasoning,
+            "target_object": structured.target_object or local.target_object,
+            "target_phrase": structured.target_phrase or local.target_phrase,
+            "location_hint": " ".join(item.raw_text for item in relations).strip()
+            or local.location_hint,
+            "action": local.action,
+            "quantity": quantity,
+            "minimum_count": minimum_count,
+            "maximum_results": inferred_maximum,
+            "attributes": attributes,
+            "relations": relations,
+            "anchor_objects": anchors,
+            "reasoning_complexity": structured_complexity,
+            "requires_guided_reasoning": bool(
+                structured.requires_guided_reasoning
+                or local.requires_guided_reasoning
+                or structured.negated_attributes
+            ),
         }
         for key, value in inferred.items():
             current = getattr(request, key)
@@ -185,14 +250,26 @@ class LocalGroundingService:
             elif not current and value:
                 updates[key] = value
 
-        metadata = dict(request.metadata)
-        metadata["guidance_reasons"] = parsed.guidance_reasons
+        metadata = source_metadata
+        metadata.update(
+            {
+                "parser_mode": parser_mode,
+                "parser_source": structured.parser_source,
+                "parser_confidence": structured.parser_confidence,
+                "parser_fallback_reason": structured.fallback_reason,
+                "candidate_prompts": list(structured.candidate_prompts),
+                "negated_attributes": list(structured.negated_attributes),
+                "anchor_phrases": list(structured.anchor_phrases),
+                "recommended_backend": structured.recommended_backend,
+                "guidance_reasons": guidance_reasons,
+            }
+        )
         updates["metadata"] = metadata
         effective = request.model_copy(update=updates)
         duration = (time.perf_counter() - started) * 1000.0
         trace = TraceEvent(
             stage="prompt_parser", status="parsed", duration_ms=duration,
-            message="preserved quantity, attributes, and all spatial constraints",
+            message="validated structured task and preserved grounding constraints",
             data={
                 "target_object": effective.target_object,
                 "target_phrase": effective.target_phrase,
@@ -206,7 +283,13 @@ class LocalGroundingService:
                 "anchor_objects": effective.anchor_objects,
                 "reasoning_complexity": effective.reasoning_complexity,
                 "requires_guided_reasoning": effective.requires_guided_reasoning,
-                "guidance_reasons": parsed.guidance_reasons,
+                "guidance_reasons": guidance_reasons,
+                "parser_mode": parser_mode,
+                "parser_source": structured.parser_source,
+                "parser_confidence": structured.parser_confidence,
+                "parser_fallback_reason": structured.fallback_reason,
+                "candidate_prompts": structured.candidate_prompts,
+                "negated_attributes": structured.negated_attributes,
                 "fields_inferred": sorted(updates),
             },
         )

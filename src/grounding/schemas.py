@@ -38,6 +38,7 @@ class ReasoningComplexity(StrEnum):
 
 
 class PerformanceMode(StrEnum):
+    QUALITY = "quality"
     FAST = "fast"
     BALANCED = "balanced"
     ACCURATE = "accurate"

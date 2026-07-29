@@ -105,10 +105,15 @@ class VideoGroundingProcessor:
         progress_callback: ProgressCallback | None = None,
         use_llm_parser: bool = True,
         use_segmentation: bool = False,
+        performance_mode: str = "balanced",
     ) -> dict[str, Any]:
         cv2 = self._cv2()
         plan = self.task_parser.parse(instruction, use_llm=use_llm_parser)
-        selected_backend = self._select_backend(preferred_backend, plan)
+        selected_backend = self._select_backend(
+            preferred_backend,
+            plan,
+            performance_mode,
+        )
 
         capture = cv2.VideoCapture(source)
         if not capture.isOpened():
@@ -206,6 +211,7 @@ class VideoGroundingProcessor:
                                 plan=plan,
                                 preferred_backend=selected_backend,
                                 maximum_latency_ms=maximum_latency_ms,
+                                performance_mode=performance_mode,
                             )
                             model_calls += 1
                             last_grounding_status = observation.status
@@ -438,6 +444,7 @@ class VideoGroundingProcessor:
             "instruction": instruction,
             "plan": plan.model_dump(),
             "requested_backend": selected_backend,
+            "performance_mode": performance_mode,
             "source": str(source),
             "source_fps": source_fps,
             "total_source_frames": total_source_frames,
@@ -486,12 +493,18 @@ class VideoGroundingProcessor:
         )
 
     @staticmethod
-    def _select_backend(explicit: str | None, plan: VideoTaskPlan) -> str | None:
+    def _select_backend(
+        explicit: str | None,
+        plan: VideoTaskPlan,
+        performance_mode: str = "balanced",
+    ) -> str | None:
         value = normalize_text(explicit)
         if value in {"", "auto", "none"}:
             value = ""
         if value:
             return value
+        if normalize_text(performance_mode) in {"quality", "accurate"}:
+            return "gpt_guided_owlvit"
         return plan.recommended_backend
 
     def _ground(
@@ -501,6 +514,7 @@ class VideoGroundingProcessor:
         plan: VideoTaskPlan,
         preferred_backend: str | None,
         maximum_latency_ms: int,
+        performance_mode: str,
     ) -> tuple[GroundingObservation, float]:
         started = time.perf_counter()
         observation = self.service.ground_frame(
@@ -509,7 +523,7 @@ class VideoGroundingProcessor:
             target_object=plan.target_object,
             location_hint=plan.location_hint,
             action="find",
-            performance_mode="balanced",
+            performance_mode=performance_mode,
             preferred_backend=preferred_backend,
             maximum_latency_ms=maximum_latency_ms,
             jpeg_quality=self.jpeg_quality,

@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .schemas import BackendHealth, GroundingRequest, HealthStatus, ReasoningComplexity
+from .schemas import (
+    BackendHealth,
+    GroundingRequest,
+    HealthStatus,
+    PerformanceMode,
+    ReasoningComplexity,
+)
 from .task_parser import normalize_text, parse_grounding_prompt
 
 
@@ -58,7 +64,17 @@ class GroundingRouter:
                 guidance_reasons=reasons,
             )
 
-        if guided:
+        if request.performance_mode in {PerformanceMode.QUALITY, PerformanceMode.ACCURATE}:
+            proposed = ["gpt_guided_owlvit", "remote", "owlvit"]
+            reason = "quality mode requires the full guided refinement pipeline"
+        elif request.performance_mode == PerformanceMode.FAST:
+            if self._target_supported_by_yolo(target):
+                proposed = ["yolo", "owlvit", "remote"]
+                reason = "fast mode selected local closed-vocabulary detection"
+            else:
+                proposed = ["owlvit", "remote", "yolo"]
+                reason = "fast mode selected local open-vocabulary detection"
+        elif guided:
             proposed = ["gpt_guided_owlvit", "remote"]
             if self.policy.guided_fallback_to_owlvit:
                 proposed.append("owlvit")

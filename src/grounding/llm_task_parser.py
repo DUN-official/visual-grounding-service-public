@@ -1,9 +1,4 @@
-"""One-shot LLM task parsing for video sessions.
-
-The parser is intentionally separate from frame inference. It runs once when a
-video session starts, preserves the user's original instruction unchanged, and
-returns a small validated plan used only for routing and target/anchor safety.
-"""
+"""Validated one-shot task parsing for image and video grounding."""
 
 from __future__ import annotations
 
@@ -38,13 +33,18 @@ class VideoTaskPlan:
     parser_source: str = "local"
     parser_confidence: float = 0.0
     parser_error: str | None = None
+    quantity: str = "unknown"
+    minimum_count: int = 1
+    candidate_prompts: list[str] = field(default_factory=list)
+    negated_attributes: list[str] = field(default_factory=list)
+    reasoning_complexity: str = "simple"
 
     def model_dump(self) -> dict[str, Any]:
         return asdict(self)
 
 
 class LLMVideoTaskParser:
-    """Parse one instruction once, with deterministic fallback.
+    """Parse one grounding instruction once, with deterministic fallback.
 
     The OpenAI call is text-only and does not run per frame. The original
     instruction is never rewritten before being sent to the image-grounding
@@ -57,7 +57,7 @@ class LLMVideoTaskParser:
     def parse(self, instruction: str, *, use_llm: bool = True) -> VideoTaskPlan:
         original = instruction.strip()
         if not original:
-            raise ValueError("video instruction must not be empty")
+            raise ValueError("grounding instruction must not be empty")
 
         local_plan = self._local_plan(original)
         api_key = resolve_openai_api_key()
@@ -124,31 +124,51 @@ class LLMVideoTaskParser:
             recommended_backend=recommended,
             parser_source="local",
             parser_confidence=0.70 if parsed.target_object else 0.35,
+            quantity=parsed.quantity.value,
+            minimum_count=parsed.minimum_count,
+            candidate_prompts=list(
+                dict.fromkeys(
+                    value
+                    for value in [parsed.target_object, parsed.target_phrase]
+                    if value
+                )
+            ),
+            reasoning_complexity=parsed.reasoning_complexity.value,
         )
 
     @staticmethod
     def _prompt(instruction: str) -> str:
         schema = {
-            "target_object": "the object the user wants tracked, never the reference object",
-            "target_phrase": "full target noun phrase",
-            "target_attributes": ["attributes belonging only to the target"],
+            "action": "find | track | follow | monitor | approach | pickup | deliver",
+            "target": {
+                "object": "canonical target object, never a reference object",
+                "phrase": "complete target noun phrase",
+                "attributes": ["attributes belonging only to the target"],
+                "negated_attributes": ["excluded target properties"],
+                "quantity": "one | multiple | all | unknown",
+                "minimum_count": 1,
+            },
             "relations": [
                 {
-                    "relation": "canonical spatial relation",
+                    "type": "canonical spatial relation",
                     "anchor_object": "reference object noun",
                     "anchor_phrase": "full reference phrase",
                     "anchor_attributes": ["attributes belonging only to anchor"],
+                    "raw_text": "relation phrase from the instruction",
                 }
             ],
-            "requires_guided_reasoning": True,
+            "candidate_prompts": ["short detector prompts for the target only"],
+            "requires_instance_selection": True,
+            "reasoning_complexity": "simple | guided | multi_constraint",
             "recommended_backend": "yolo | owlvit | gpt_guided_owlvit",
             "confidence": 0.0,
         }
         return (
-            "Parse this visual tracking instruction. Distinguish the requested TARGET from "
-            "all REFERENCE/ANCHOR objects. The object before a spatial relation is normally "
-            "the target; the object after the relation is normally the anchor. Never swap "
-            "them. Return JSON only, with exactly this structure:\n"
+            "Parse this visual-grounding instruction. Distinguish the requested TARGET from "
+            "all REFERENCE or ANCHOR objects. Preserve attributes, quantities, ordinals, "
+            "negation, and every spatial relation. Candidate prompts must describe only the "
+            "target class or target phrase, never an anchor by itself. Return JSON only with "
+            "exactly this structure:\n"
             + json.dumps(schema)
             + "\nInstruction: "
             + instruction
@@ -175,77 +195,31 @@ class LLMVideoTaskParser:
         payload: dict[str, Any],
         fallback: VideoTaskPlan,
     ) -> VideoTaskPlan:
-        target_object = self._clean_text(payload.get("target_object")) or fallback.target_object
-        target_phrase = self._clean_text(payload.get("target_phrase")) or target_object or fallback.target_phrase
-        attributes = self._string_list(payload.get("target_attributes")) or list(fallback.attributes)
-
-        relations: list[dict[str, Any]] = []
-        anchors: list[str] = []
-        anchor_phrases: list[str] = []
-        for raw in payload.get("relations") or []:
-            if not isinstance(raw, dict):
-                continue
-            anchor_object = self._clean_text(raw.get("anchor_object"))
-            anchor_phrase = self._clean_text(raw.get("anchor_phrase")) or anchor_object
-            relation = self._clean_text(raw.get("relation"))
-            if not relation or not anchor_object:
-                continue
-            if target_object and normalize_text(anchor_object) == normalize_text(target_object):
-                continue
-            item = {
-                "relation": relation,
-                "anchor_object": anchor_object,
-                "anchor_phrase": anchor_phrase,
-                "anchor_attributes": self._string_list(raw.get("anchor_attributes")),
-                "raw_text": f"{relation} {anchor_phrase or anchor_object}",
-            }
-            relations.append(item)
-            anchors.append(anchor_object)
-            if anchor_phrase:
-                anchor_phrases.append(anchor_phrase)
-
-        if not relations:
-            relations = list(fallback.relations)
-            anchors = list(fallback.anchor_objects)
-            anchor_phrases = list(fallback.anchor_phrases)
-
-        guided = bool(
-            payload.get("requires_guided_reasoning")
-            or relations
-            or attributes
-            or fallback.requires_guided_reasoning
-        )
-        backend = self._clean_text(payload.get("recommended_backend"))
-        if backend not in _BACKENDS:
-            backend = "gpt_guided_owlvit" if guided else fallback.recommended_backend
-        if guided:
-            backend = "gpt_guided_owlvit"
-
-        confidence = payload.get("confidence", 0.85)
-        try:
-            confidence_value = max(0.0, min(1.0, float(confidence)))
-        except (TypeError, ValueError):
-            confidence_value = 0.85
-
+        parsed = _from_service_payload(instruction, payload, fallback)
         location_hint = " ".join(
-            str(item.get("raw_text") or "").strip() for item in relations
+            str(item.get("raw_text") or "").strip() for item in parsed.relations
         ).strip() or fallback.location_hint
-
         return VideoTaskPlan(
             instruction=instruction,
             normalized_instruction=self._normalize_tracking_action(instruction),
             action="track",
-            target_object=target_object,
-            target_phrase=target_phrase,
+            target_object=parsed.target_object,
+            target_phrase=parsed.target_phrase,
             location_hint=location_hint,
-            attributes=attributes,
-            relations=relations,
-            anchor_objects=list(dict.fromkeys(anchors)),
-            anchor_phrases=list(dict.fromkeys(anchor_phrases)),
-            requires_guided_reasoning=guided,
-            recommended_backend=backend,
-            parser_source="llm",
-            parser_confidence=confidence_value,
+            attributes=list(parsed.attributes),
+            relations=list(parsed.relations),
+            anchor_objects=list(parsed.anchor_objects),
+            anchor_phrases=list(parsed.anchor_phrases),
+            requires_guided_reasoning=parsed.requires_guided_reasoning,
+            recommended_backend=parsed.recommended_backend,
+            parser_source=parsed.parser_source,
+            parser_confidence=parsed.parser_confidence,
+            parser_error=parsed.fallback_reason,
+            quantity=parsed.quantity,
+            minimum_count=parsed.minimum_count,
+            candidate_prompts=list(parsed.candidate_prompts),
+            negated_attributes=list(parsed.negated_attributes),
+            reasoning_complexity=parsed.reasoning_complexity,
         )
 
     @staticmethod
@@ -275,6 +249,11 @@ class ParsedVideoTask:
     parser_source: str = "local"
     parser_confidence: float = 0.0
     fallback_reason: str | None = None
+    quantity: str = "unknown"
+    minimum_count: int = 1
+    candidate_prompts: list[str] = field(default_factory=list)
+    negated_attributes: list[str] = field(default_factory=list)
+    reasoning_complexity: str = "simple"
 
 
 def parse_task_with_service(
@@ -283,7 +262,7 @@ def parse_task_with_service(
     *,
     parser_mode: str = "llm",
 ) -> ParsedVideoTask:
-    """Parse one video instruction using the loaded GPT client when available."""
+    """Parse one instruction using a service client or request-scoped credentials."""
 
     parser = LLMVideoTaskParser()
     local = parser._local_plan(instruction)
@@ -301,13 +280,16 @@ def parse_task_with_service(
                 client = None
         else:
             client = getattr(backend, "_client", None)
-    loaded = False
-    if backend is not None:
-        try:
-            loaded = bool(backend.health().loaded)
-        except Exception:
-            loaded = bool(getattr(backend, "_loaded", False))
-    if not loaded or client is None:
+    if client is None:
+        api_key = resolve_openai_api_key()
+        if api_key:
+            try:
+                from openai import OpenAI
+
+                client = OpenAI(api_key=api_key, timeout=60.0, max_retries=1)
+            except Exception:
+                client = None
+    if client is None:
         parsed = _from_local(local)
         parsed.parser_source = "local_fallback"
         parsed.fallback_reason = "GPT task parser is unavailable; local parser used"
@@ -344,6 +326,17 @@ def _from_service_payload(
     attributes = _strings(
         target_payload.get("attributes") or payload.get("target_attributes")
     ) or list(local.attributes)
+    negated_attributes = _strings(
+        target_payload.get("negated_attributes") or payload.get("negated_attributes")
+    )
+    candidate_prompts = _strings(payload.get("candidate_prompts"))
+    candidate_prompts = list(
+        dict.fromkeys(
+            value
+            for value in [target_object, target_phrase, *candidate_prompts]
+            if value
+        )
+    )[:12]
 
     relations: list[dict[str, Any]] = []
     anchors: list[str] = []
@@ -381,6 +374,7 @@ def _from_service_payload(
         target_object = local.target_object
         target_phrase = local.target_phrase
         attributes = list(local.attributes)
+        candidate_prompts = list(local.candidate_prompts)
         fallback_reason = (
             "Parsed target matched a reference anchor; local target retained"
         )
@@ -403,6 +397,20 @@ def _from_service_payload(
     except (TypeError, ValueError):
         confidence = 0.85
 
+    quantity = _clean(target_payload.get("quantity") or payload.get("quantity"))
+    if quantity not in {"one", "multiple", "all", "unknown"}:
+        quantity = local.quantity
+    try:
+        minimum_count = max(
+            1,
+            min(100, int(target_payload.get("minimum_count") or payload.get("minimum_count") or local.minimum_count)),
+        )
+    except (TypeError, ValueError):
+        minimum_count = local.minimum_count
+    reasoning_complexity = _clean(payload.get("reasoning_complexity"))
+    if reasoning_complexity not in {"simple", "guided", "multi_constraint"}:
+        reasoning_complexity = local.reasoning_complexity
+
     return ParsedVideoTask(
         instruction=instruction,
         target_object=target_object,
@@ -416,6 +424,11 @@ def _from_service_payload(
         parser_source="llm" if fallback_reason is None else "local_fallback",
         parser_confidence=confidence,
         fallback_reason=fallback_reason,
+        quantity=quantity,
+        minimum_count=minimum_count,
+        candidate_prompts=candidate_prompts,
+        negated_attributes=negated_attributes,
+        reasoning_complexity=reasoning_complexity,
     )
 
 
@@ -432,6 +445,11 @@ def _from_local(plan: VideoTaskPlan) -> ParsedVideoTask:
         recommended_backend=plan.recommended_backend,
         parser_source=plan.parser_source,
         parser_confidence=plan.parser_confidence,
+        quantity=plan.quantity,
+        minimum_count=plan.minimum_count,
+        candidate_prompts=list(plan.candidate_prompts),
+        negated_attributes=list(plan.negated_attributes),
+        reasoning_complexity=plan.reasoning_complexity,
     )
 
 

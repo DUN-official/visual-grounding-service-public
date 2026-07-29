@@ -20,6 +20,18 @@ BACKENDS = {
     "GPT-guided OWL-ViT": "gpt_guided_owlvit",
 }
 
+PERFORMANCE_MODES = {
+    "Quality": PerformanceMode.QUALITY,
+    "Balanced": PerformanceMode.BALANCED,
+    "Fast": PerformanceMode.FAST,
+}
+
+MODE_LATENCY_MS = {
+    PerformanceMode.QUALITY: 300_000,
+    PerformanceMode.BALANCED: 200_000,
+    PerformanceMode.FAST: 120_000,
+}
+
 
 def render_image_tab(runtime: ServiceRuntime, *, api_key: str | None = None) -> None:
     with st.form("image-grounding-form"):
@@ -32,6 +44,15 @@ def render_image_tab(runtime: ServiceRuntime, *, api_key: str | None = None) -> 
             "Instruction",
             placeholder="Find the package beside the table",
             key="image-instruction",
+        )
+        mode_label = st.selectbox(
+            "Profile",
+            list(PERFORMANCE_MODES),
+            help=(
+                "Quality uses multi-stage guided localization. Balanced limits "
+                "remote review, while Fast prioritizes local inference."
+            ),
+            key="image-performance-mode",
         )
         backend_label = st.selectbox("Backend", list(BACKENDS), key="image-backend")
         maximum_results = st.slider(
@@ -55,7 +76,17 @@ def render_image_tab(runtime: ServiceRuntime, *, api_key: str | None = None) -> 
             st.error("Enter an instruction before running grounding.")
             return
 
-        if BACKENDS[backend_label] == "gpt_guided_owlvit" and not api_key:
+        performance_mode = PERFORMANCE_MODES[mode_label]
+        if performance_mode == PerformanceMode.QUALITY and BACKENDS[backend_label] not in {
+            None,
+            "gpt_guided_owlvit",
+        }:
+            st.error("Quality profile requires Auto or GPT-guided OWL-ViT as the backend.")
+            return
+        if (
+            performance_mode == PerformanceMode.QUALITY
+            or BACKENDS[backend_label] == "gpt_guided_owlvit"
+        ) and not api_key:
             st.error("Enter an OpenAI API key in the sidebar to use GPT-guided OWL-ViT.")
             return
 
@@ -67,18 +98,19 @@ def render_image_tab(runtime: ServiceRuntime, *, api_key: str | None = None) -> 
                 media_type=media_type,
             ),
             instruction=instruction.strip(),
-            performance_mode=PerformanceMode.BALANCED,
+            performance_mode=performance_mode,
             maximum_results=maximum_results,
             quantity=(
                 QuantityIntent.MULTIPLE
                 if maximum_results > 1
                 else QuantityIntent.UNKNOWN
             ),
-            maximum_latency_ms=200_000,
+            maximum_latency_ms=MODE_LATENCY_MS[performance_mode],
             preferred_backend=BACKENDS[backend_label],
             metadata={
                 "uploaded_filename": uploaded.name,
                 "input_mode": "streamlit_upload",
+                "parser_mode": "llm",
                 "return_segmentation": segmentation,
             },
         )
@@ -97,6 +129,25 @@ def render_image_tab(runtime: ServiceRuntime, *, api_key: str | None = None) -> 
         st.warning(result.error or "No grounded target was returned.")
     st.subheader("Structured result")
     st.json(result.model_dump(mode="json"))
+    with st.expander("Pipeline diagnostics"):
+        parser_event = next(
+            (
+                event.model_dump(mode="json")
+                for event in result.trace
+                if event.stage == "prompt_parser"
+            ),
+            None,
+        )
+        st.json(
+            {
+                "backend_used": result.backend_used,
+                "parser": parser_event,
+                "profile": result.metadata.get("performance_profile"),
+                "pipeline_path": result.metadata.get("pipeline_path"),
+                "stage_latencies_ms": result.metadata.get("stage_latencies_ms"),
+                "gpt_request_count": result.metadata.get("gpt_request_count"),
+            }
+        )
     left, right = st.columns(2)
     with left:
         st.download_button(

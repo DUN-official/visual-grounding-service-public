@@ -239,6 +239,7 @@ class HTTPGroundingServiceAdapter:
         data: dict[str, str] = {
             "instruction": instruction,
             "performance_mode": performance_mode,
+            "parser_mode": "local",
             "maximum_results": "1",
             "maximum_latency_ms": str(int(maximum_latency_ms)),
         }
@@ -313,13 +314,14 @@ class LocalGroundingServiceAdapter:
             preferred_backend=preferred_backend,
             maximum_results=1,
             maximum_latency_ms=maximum_latency_ms,
-            metadata={"input_mode": "video_frame"},
+            metadata={"input_mode": "video_frame", "parser_mode": "local"},
         )
         if self._prepare_backend is not None:
             self._prepare_backend(
                 preferred_backend,
                 instruction,
                 api_key=self.api_key,
+                performance_mode=performance_mode,
             )
         with self._lock, use_openai_api_key(self.api_key):
             result = self.service.ground(request)

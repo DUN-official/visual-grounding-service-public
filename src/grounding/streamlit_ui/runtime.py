@@ -15,7 +15,7 @@ from ..provisioning import (
     provision_owlvit,
     provision_yolo,
 )
-from ..schemas import GroundingRequest, GroundingResult
+from ..schemas import GroundingRequest, GroundingResult, PerformanceMode
 from ..services.local_service import LocalGroundingService
 from ..task_parser import normalize_text, parse_grounding_prompt
 from ..video.service_adapter import LocalGroundingServiceAdapter
@@ -63,6 +63,7 @@ class ServiceRuntime:
             request.preferred_backend,
             request.instruction,
             api_key=api_key,
+            performance_mode=request.performance_mode,
         )
         self.ensure_backend(backend_name, api_key=api_key)
         with self.lock, use_openai_api_key(api_key):
@@ -74,9 +75,20 @@ class ServiceRuntime:
         instruction: str,
         *,
         api_key: str | None = None,
+        performance_mode: PerformanceMode | str = PerformanceMode.BALANCED,
     ) -> str:
         if preferred_backend:
             return preferred_backend
+
+        mode = (
+            performance_mode
+            if isinstance(performance_mode, PerformanceMode)
+            else PerformanceMode(performance_mode)
+        )
+        if mode in {PerformanceMode.QUALITY, PerformanceMode.ACCURATE}:
+            if not (api_key or os.environ.get("OPENAI_API_KEY")):
+                raise ValueError("Quality mode requires an OpenAI API key.")
+            return "gpt_guided_owlvit"
 
         parsed = parse_grounding_prompt(instruction)
         if parsed.requires_guided_reasoning and api_key:
@@ -92,11 +104,13 @@ class ServiceRuntime:
         instruction: str,
         *,
         api_key: str | None = None,
+        performance_mode: PerformanceMode | str = PerformanceMode.BALANCED,
     ) -> str:
         backend_name = self.select_backend(
             preferred_backend,
             instruction,
             api_key=api_key,
+            performance_mode=performance_mode,
         )
         self.ensure_backend(backend_name, api_key=api_key)
         return backend_name

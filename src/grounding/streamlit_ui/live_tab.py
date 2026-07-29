@@ -10,8 +10,9 @@ import streamlit as st
 from streamlit_webrtc import webrtc_streamer
 
 from ..segmentation import draw_segmentation_overlay, segment_from_box
+from ..schemas import PerformanceMode
 from ..video.tracker import OpenCVBoxTracker
-from .image_tab import BACKENDS
+from .image_tab import BACKENDS, MODE_LATENCY_MS, PERFORMANCE_MODES
 from .runtime import ServiceRuntime
 
 
@@ -23,6 +24,7 @@ class LiveFrameController:
         self.tracker = OpenCVBoxTracker("AUTO")
         self.instruction = ""
         self.backend: str | None = None
+        self.performance_mode = PerformanceMode.QUALITY
         self.use_segmentation = False
         self.current_box = None
         self.state = "IDLE"
@@ -39,12 +41,18 @@ class LiveFrameController:
         *,
         instruction: str,
         backend: str | None,
+        performance_mode: PerformanceMode,
         use_segmentation: bool,
     ) -> None:
         with self.lock:
-            changed = (instruction, backend) != (self.instruction, self.backend)
+            changed = (instruction, backend, performance_mode) != (
+                self.instruction,
+                self.backend,
+                self.performance_mode,
+            )
             self.instruction = instruction
             self.backend = backend
+            self.performance_mode = performance_mode
             self.use_segmentation = use_segmentation
             if changed:
                 self._reset_locked("REACQUIRING")
@@ -58,6 +66,7 @@ class LiveFrameController:
             return {
                 "state": self.state,
                 "backend": self.backend_used or self.backend or "auto",
+                "profile": self.performance_mode.value,
                 "tracker": self.tracker.active_type or "acquiring",
                 "tracking_fps": round(self.fps, 1),
                 "confidence": round(self.confidence, 3),
@@ -87,8 +96,9 @@ class LiveFrameController:
                     frame,
                     instruction=self.instruction,
                     preferred_backend=self.backend,
-                    maximum_latency_ms=200_000,
-                    jpeg_quality=90,
+                    performance_mode=self.performance_mode.value,
+                    maximum_latency_ms=MODE_LATENCY_MS[self.performance_mode],
+                    jpeg_quality=92 if self.performance_mode == PerformanceMode.QUALITY else 90,
                 )
                 if observation.success and observation.bbox_xyxy is not None:
                     self.tracker.initialize(frame, observation.bbox_xyxy)
@@ -162,11 +172,12 @@ class LiveFrameController:
 @st.fragment(run_every=1.0)
 def _render_metrics(controller: LiveFrameController) -> None:
     metrics = controller.snapshot()
-    columns = st.columns(4)
+    columns = st.columns(5)
     columns[0].metric("Tracking state", metrics["state"])
-    columns[1].metric("Backend", metrics["backend"])
-    columns[2].metric("Tracker", metrics["tracker"])
-    columns[3].metric("Tracking FPS", metrics["tracking_fps"])
+    columns[1].metric("Profile", metrics["profile"].title())
+    columns[2].metric("Backend", metrics["backend"])
+    columns[3].metric("Tracker", metrics["tracker"])
+    columns[4].metric("Tracking FPS", metrics["tracking_fps"])
 
 
 def render_live_tab(runtime: ServiceRuntime, *, api_key: str | None = None) -> None:
@@ -174,6 +185,12 @@ def render_live_tab(runtime: ServiceRuntime, *, api_key: str | None = None) -> N
         "Instruction",
         placeholder="Track the package beside the table",
         key="live-instruction",
+    )
+    mode_label = st.selectbox(
+        "Profile",
+        list(PERFORMANCE_MODES),
+        help="The profile applies to acquisition and re-acquisition frames.",
+        key="live-performance-mode",
     )
     backend_label = st.selectbox("Backend", list(BACKENDS), key="live-backend")
     segmentation = st.checkbox(
@@ -185,7 +202,17 @@ def render_live_tab(runtime: ServiceRuntime, *, api_key: str | None = None) -> N
     )
 
     selected_backend = BACKENDS[backend_label]
-    if selected_backend == "gpt_guided_owlvit" and not api_key:
+    performance_mode = PERFORMANCE_MODES[mode_label]
+    if performance_mode == PerformanceMode.QUALITY and selected_backend not in {
+        None,
+        "gpt_guided_owlvit",
+    }:
+        st.warning("Quality profile requires Auto or GPT-guided OWL-ViT as the backend.")
+        return
+    if (
+        performance_mode == PerformanceMode.QUALITY
+        or selected_backend == "gpt_guided_owlvit"
+    ) and not api_key:
         st.warning("Enter an OpenAI API key in the sidebar before starting GPT-guided live grounding.")
         return
 
@@ -199,6 +226,7 @@ def render_live_tab(runtime: ServiceRuntime, *, api_key: str | None = None) -> N
     controller.configure(
         instruction=instruction.strip(),
         backend=selected_backend,
+        performance_mode=performance_mode,
         use_segmentation=segmentation,
     )
 

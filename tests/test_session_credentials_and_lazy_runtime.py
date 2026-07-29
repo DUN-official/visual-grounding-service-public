@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from grounding.backends.gpt_guided_owlvit_backend import GPTGuidedOWLViTBackend
 from grounding.openai_context import resolve_openai_api_key, use_openai_api_key
 from grounding.streamlit_ui.runtime import ServiceRuntime
@@ -60,3 +62,26 @@ def test_streamlit_runtime_defers_model_startup_and_selects_by_instruction():
         )
         == "gpt_guided_owlvit"
     )
+
+
+def test_quality_profile_selects_guided_backend_and_requires_key(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "grounding_service.json"
+    )
+    runtime = ServiceRuntime.from_config(config_path)
+
+    assert runtime.select_backend(
+        None,
+        "find the person",
+        api_key="session-key",
+        performance_mode="quality",
+    ) == "gpt_guided_owlvit"
+    with pytest.raises(ValueError, match="Quality mode requires"):
+        runtime.select_backend(
+            None,
+            "find the person",
+            performance_mode="quality",
+        )
