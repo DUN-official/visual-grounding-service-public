@@ -47,11 +47,12 @@ class VideoGroundingProcessor:
         output_root: str | Path = "runtime/video_sessions",
         tracker_type: str = "AUTO",
         lost_frames: int = 8,
+        poor_quality_frames_to_reacquire: int = 3,
         acquisition_interval_frames: int = 30,
         maximum_acquisition_interval_frames: int = 120,
-        smoothing_alpha: float = 0.28,
+        smoothing_alpha: float = 0.55,
         tracker_confidence_decay: float = 0.999,
-        minimum_tracker_quality: float = 0.25,
+        minimum_tracker_quality: float = 0.45,
         jpeg_quality: int = 92,
         tracking_max_width: int = 1280,
         progress_interval_frames: int = 15,
@@ -62,6 +63,10 @@ class VideoGroundingProcessor:
         self.output_root = Path(output_root)
         self.tracker_type = tracker_type
         self.lost_frames = max(1, int(lost_frames))
+        self.poor_quality_frames_to_reacquire = max(
+            1,
+            int(poor_quality_frames_to_reacquire),
+        )
         self.acquisition_interval_frames = max(1, int(acquisition_interval_frames))
         self.maximum_acquisition_interval_frames = max(
             self.acquisition_interval_frames,
@@ -276,11 +281,6 @@ class VideoGroundingProcessor:
                                 width,
                                 height,
                             )
-                            current_box = _smooth_box(
-                                current_box,
-                                tracked_box,
-                                self.smoothing_alpha,
-                            )
                             current_confidence *= self.tracker_confidence_decay
                             source_kind = tracker.last_source
                             misses = 0
@@ -288,6 +288,11 @@ class VideoGroundingProcessor:
                                 poor_quality_frames += 1
                                 state = "UNCERTAIN"
                             else:
+                                current_box = _smooth_box(
+                                    current_box,
+                                    tracked_box,
+                                    self.smoothing_alpha,
+                                )
                                 poor_quality_frames = 0
                                 state = "TRACKING"
                         else:
@@ -296,7 +301,8 @@ class VideoGroundingProcessor:
 
                         if (
                             misses >= self.lost_frames
-                            or poor_quality_frames >= self.lost_frames
+                            or poor_quality_frames
+                            >= self.poor_quality_frames_to_reacquire
                         ):
                             tracker.reset()
                             current_box = None
@@ -470,6 +476,11 @@ class VideoGroundingProcessor:
             "final_state": state,
             "tracker_requested": tracker.requested_type,
             "tracker_used": tracker.active_type,
+            "minimum_tracker_quality": self.minimum_tracker_quality,
+            "poor_quality_frames_to_reacquire": (
+                self.poor_quality_frames_to_reacquire
+            ),
+            "smoothing_alpha": self.smoothing_alpha,
             "annotated_video_path": (
                 str(final_annotated_path) if save_video and final_annotated_path.exists() else None
             ),

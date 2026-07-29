@@ -128,7 +128,11 @@ def _process_video(
             adapter,
             output_root=output_root,
             tracker_type="AUTO",
+            lost_frames=5,
+            poor_quality_frames_to_reacquire=3,
             maximum_acquisition_interval_frames=120,
+            smoothing_alpha=0.55,
+            minimum_tracker_quality=0.45,
             tracking_max_width=1280,
             progress_interval_frames=15,
         )

@@ -25,6 +25,7 @@ class OpenCVBoxTracker:
         minimum_area_ratio: float = 0.45,
         maximum_area_ratio: float = 2.40,
         template_recovery_threshold: float = 0.58,
+        minimum_appearance_similarity: float = 0.55,
     ) -> None:
         self.requested_type = (tracker_type or "AUTO").upper()
         self.active_type: str | None = None
@@ -33,11 +34,16 @@ class OpenCVBoxTracker:
         self.minimum_area_ratio = max(0.05, float(minimum_area_ratio))
         self.maximum_area_ratio = max(self.minimum_area_ratio, float(maximum_area_ratio))
         self.template_recovery_threshold = max(0.0, min(1.0, float(template_recovery_threshold)))
+        self.minimum_appearance_similarity = max(
+            0.0,
+            min(1.0, float(minimum_appearance_similarity)),
+        )
         self._tracker = None
         self._previous_tracking_box: Box | None = None
         self._target_fractions: tuple[float, float, float, float] | None = None
         self._template = None
         self.last_quality = 0.0
+        self.last_appearance_similarity = 0.0
         self.last_source = "none"
 
     @staticmethod
@@ -69,6 +75,7 @@ class OpenCVBoxTracker:
         self._target_fractions = None
         self._template = None
         self.last_quality = 0.0
+        self.last_appearance_similarity = 0.0
         self.last_source = "none"
 
     def initialize(self, frame, bbox_xyxy: Box) -> None:
@@ -92,6 +99,7 @@ class OpenCVBoxTracker:
         self._previous_tracking_box = tracking
         self._template = self._crop_gray(frame, tracking)
         self.last_quality = 1.0
+        self.last_appearance_similarity = 1.0
         self.last_source = "grounding"
 
     def update(self, frame) -> tuple[bool, Box | None]:
@@ -102,17 +110,26 @@ class OpenCVBoxTracker:
         if ok:
             tracking = self._clip(self._xywh_to_xyxy(xywh), frame.shape[1], frame.shape[0])
             if self._plausible(self._previous_tracking_box, tracking, frame.shape[1], frame.shape[0]):
-                quality = self._motion_quality(self._previous_tracking_box, tracking, frame.shape[1], frame.shape[0])
-                self._previous_tracking_box = tracking
-                self.last_quality = quality
-                self.last_source = "tracker"
-                return True, self._target_from_tracking(tracking)
+                motion_quality = self._motion_quality(
+                    self._previous_tracking_box,
+                    tracking,
+                    frame.shape[1],
+                    frame.shape[0],
+                )
+                appearance = self._appearance_similarity(frame, tracking)
+                self.last_appearance_similarity = appearance
+                if appearance >= self.minimum_appearance_similarity:
+                    self._previous_tracking_box = tracking
+                    self.last_quality = min(motion_quality, appearance)
+                    self.last_source = "tracker"
+                    return True, self._target_from_tracking(tracking)
 
         recovered = self._template_recover(frame)
         if recovered is not None:
             self._previous_tracking_box = recovered
             self.last_source = "template_recovery"
             self.last_quality = max(self.last_quality, self.template_recovery_threshold)
+            self.last_appearance_similarity = self.last_quality
             try:
                 tracker = self._create()
                 tracker.init(frame, self._xyxy_to_xywh(recovered))
@@ -122,8 +139,33 @@ class OpenCVBoxTracker:
             return True, self._target_from_tracking(recovered)
 
         self.last_quality = 0.0
+        self.last_appearance_similarity = 0.0
         self.last_source = "lost"
         return False, None
+
+    def _appearance_similarity(self, frame, tracking: Box) -> float:
+        cv2 = self._cv2()
+        if self._template is None or self._template.size == 0:
+            return 1.0
+        candidate = self._crop_gray(frame, tracking)
+        if candidate is None or candidate.size == 0:
+            return 0.0
+        if candidate.shape != self._template.shape:
+            candidate = cv2.resize(
+                candidate,
+                (self._template.shape[1], self._template.shape[0]),
+                interpolation=cv2.INTER_AREA,
+            )
+        result = cv2.matchTemplate(
+            candidate,
+            self._template,
+            cv2.TM_CCOEFF_NORMED,
+        )
+        score = float(result[0, 0])
+        if not math.isfinite(score):
+            difference = cv2.absdiff(candidate, self._template)
+            score = 1.0 - float(difference.mean()) / 255.0
+        return max(0.0, min(1.0, score))
 
     def _target_from_tracking(self, tracking: Box) -> Box:
         if self._target_fractions is None:

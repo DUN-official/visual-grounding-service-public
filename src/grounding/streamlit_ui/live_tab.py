@@ -16,6 +16,15 @@ from .image_tab import BACKENDS, MODE_LATENCY_MS, PERFORMANCE_MODES
 from .runtime import ServiceRuntime
 
 
+def _smooth_box(previous, current, alpha=0.55):
+    if previous is None:
+        return current
+    return tuple(
+        (1.0 - alpha) * old + alpha * new
+        for old, new in zip(previous, current)
+    )
+
+
 class LiveFrameController:
     def __init__(self, runtime: ServiceRuntime, *, api_key: str | None = None) -> None:
         self.adapter = runtime.video_adapter(api_key=api_key)
@@ -31,7 +40,13 @@ class LiveFrameController:
         self.frame_index = 0
         self.next_grounding_frame = 0
         self.misses = 0
+        self.poor_quality_frames = 0
+        self.minimum_tracker_quality = 0.45
+        self.poor_quality_limit = 3
+        self.miss_limit = 4
         self.confidence = 0.0
+        self.tracker_quality = 0.0
+        self.tracker_source = "none"
         self.backend_used: str | None = None
         self.fps = 0.0
         self._last_frame_time: float | None = None
@@ -70,6 +85,8 @@ class LiveFrameController:
                 "tracker": self.tracker.active_type or "acquiring",
                 "tracking_fps": round(self.fps, 1),
                 "confidence": round(self.confidence, 3),
+                "tracker_quality": round(self.tracker_quality, 3),
+                "tracker_source": self.tracker_source,
             }
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
@@ -106,21 +123,35 @@ class LiveFrameController:
                     self.confidence = observation.confidence
                     self.backend_used = observation.backend
                     self.misses = 0
+                    self.poor_quality_frames = 0
+                    self.tracker_quality = 1.0
+                    self.tracker_source = "grounding"
                     self.state = "ACQUIRED"
                 else:
                     self.state = "SEARCHING"
-                    self.next_grounding_frame = self.frame_index + 30
+                    self.next_grounding_frame = self.frame_index + 15
             elif self.current_box is not None:
                 ok, box = self.tracker.update(frame)
+                self.tracker_quality = self.tracker.last_quality
+                self.tracker_source = self.tracker.last_source
                 if ok and box is not None:
-                    self.current_box = box
                     self.misses = 0
-                    self.state = "TRACKING"
+                    if self.tracker_quality >= self.minimum_tracker_quality:
+                        self.current_box = _smooth_box(self.current_box, box)
+                        self.poor_quality_frames = 0
+                        self.confidence *= 0.999
+                        self.state = "TRACKING"
+                    else:
+                        self.poor_quality_frames += 1
+                        self.state = "UNCERTAIN"
                 else:
                     self.misses += 1
                     self.state = "UNCERTAIN"
-                    if self.misses >= 8:
-                        self._reset_locked("LOST")
+                if (
+                    self.misses >= self.miss_limit
+                    or self.poor_quality_frames >= self.poor_quality_limit
+                ):
+                    self._reset_locked("LOST")
 
             annotated = frame.copy()
             if self.current_box is not None:
@@ -165,6 +196,9 @@ class LiveFrameController:
         self.confidence = 0.0
         self.backend_used = None
         self.misses = 0
+        self.poor_quality_frames = 0
+        self.tracker_quality = 0.0
+        self.tracker_source = "none"
         self.next_grounding_frame = self.frame_index
         self.state = state
 
@@ -172,12 +206,14 @@ class LiveFrameController:
 @st.fragment(run_every=1.0)
 def _render_metrics(controller: LiveFrameController) -> None:
     metrics = controller.snapshot()
-    columns = st.columns(5)
+    columns = st.columns(6)
     columns[0].metric("Tracking state", metrics["state"])
     columns[1].metric("Profile", metrics["profile"].title())
     columns[2].metric("Backend", metrics["backend"])
     columns[3].metric("Tracker", metrics["tracker"])
     columns[4].metric("Tracking FPS", metrics["tracking_fps"])
+    columns[5].metric("Tracker quality", metrics["tracker_quality"])
+    st.caption(f"Tracker source: {metrics['tracker_source']}")
 
 
 def render_live_tab(runtime: ServiceRuntime, *, api_key: str | None = None) -> None:
